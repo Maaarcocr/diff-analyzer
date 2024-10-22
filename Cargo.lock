@@ -94,6 +94,19 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "72b3254f16251a8381aa12e40e3c4d2f0199f8c6508fbecb9d91f575e0fbb8c6"
 
 [[package]]
+name = "bhtsne"
+version = "0.5.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4b58c87d1882ed83879287366d31923269ef39544677ab7760f5ca98ba8e4740"
+dependencies = [
+ "csv",
+ "num-traits",
+ "rand",
+ "rand_distr",
+ "rayon",
+]
+
+[[package]]
 name = "bindgen"
 version = "0.69.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -309,13 +322,16 @@ name = "diff-analyzer"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "bhtsne",
  "clap",
  "csv",
  "hf-hub",
+ "indicatif",
  "linfa",
  "linfa-clustering",
  "llama-cpp-2",
  "ndarray 0.15.6",
+ "rayon",
 ]
 
 [[package]]

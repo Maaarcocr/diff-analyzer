@@ -12,3 +12,6 @@ linfa = "0.7.0"
 linfa-clustering = "0.7.0"
 llama-cpp-2 = { version = "0.1.82", features = ["metal"] }
 ndarray = "0.15"
+bhtsne = "0.5.3"
+indicatif = "0.17.8"
+rayon = "1.10.0"
