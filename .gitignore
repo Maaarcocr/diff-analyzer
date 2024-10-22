@@ -1,3 +1,5 @@
 /target
 export.csv
 tsne_visualization.html
+*.tokens
+*.embeddings

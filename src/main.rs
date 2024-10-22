@@ -6,9 +6,10 @@
     clippy::cast_sign_loss
 )]
 
+use std::io::BufRead;
+use std::io::Write;
 use std::path::PathBuf;
 use std::vec;
-use std::io::Write;
 
 use anyhow::{Context, Result};
 use clap::Args;
@@ -28,6 +29,7 @@ use llama_cpp_2::llama_batch::LlamaBatch;
 use llama_cpp_2::model::params::LlamaModelParams;
 use llama_cpp_2::model::AddBos;
 use llama_cpp_2::model::LlamaModel;
+use llama_cpp_2::token::LlamaToken;
 use llama_cpp_2::StringToTokenError;
 use ndarray::{Array1, Array2};
 use rayon::iter::IntoParallelRefIterator;
@@ -159,7 +161,8 @@ impl Commands {
             </script>
         </body>
         </html>",
-            embeddings.embedding()
+            embeddings
+                .embedding()
                 .as_slice()
                 .chunks(2)
                 .map(|point| format!("{{x: {}, y: {}}}", point[0], point[1]))
@@ -207,10 +210,99 @@ fn get_or_load(model: &str, repo: &str) -> Result<PathBuf> {
         .with_context(|| "unable to download model")
 }
 
+pub trait Cacheable: Sized {
+    fn cache(&self, path: &PathBuf) -> Result<()>;
+    fn load(path: &PathBuf) -> Result<Self>;
+}
+
+struct Tokens {
+    tokens: Vec<Vec<LlamaToken>>,
+}
+
+impl Tokens {
+    fn new(tokens: Vec<Vec<LlamaToken>>) -> Self {
+        Self { tokens }
+    }
+}
+
+impl Cacheable for Tokens {
+    fn cache(&self, path: &PathBuf) -> Result<()> {
+        let mut file = std::fs::File::create(path)?;
+        for line in &self.tokens {
+            for token in line {
+                write!(file, "{} ", token.0)?;
+            }
+            writeln!(file)?;
+        }
+        Ok(())
+    }
+
+    fn load(path: &PathBuf) -> Result<Self> {
+        let mut tokens = Vec::new();
+        let file = std::fs::File::open(path)?;
+        for line in std::io::BufReader::new(file).lines() {
+            let line = line?;
+            let line = line.trim();
+            let line_tokens: Vec<LlamaToken> = line
+                .split_whitespace()
+                .map(|token| Ok::<_, anyhow::Error>(LlamaToken::new(token.parse()?)))
+                .collect::<Result<_>>()?;
+            tokens.push(line_tokens);
+        }
+        Ok(Self { tokens })
+    }
+}
+
+struct Embeddings {
+    embeddings: Vec<Vec<f32>>,
+}
+
+impl Embeddings {
+    fn new(embeddings: Vec<Vec<f32>>) -> Self {
+        Self { embeddings }
+    }
+}
+
+impl Cacheable for Embeddings {
+    fn cache(&self, path: &PathBuf) -> Result<()> {
+        let mut file = std::fs::File::create(path)?;
+        for line in &self.embeddings {
+            for token in line {
+                write!(file, "{} ", token)?;
+            }
+            writeln!(file)?;
+        }
+        Ok(())
+    }
+
+    fn load(path: &PathBuf) -> Result<Self> {
+        let mut embeddings = Vec::new();
+        let file = std::fs::File::open(path)?;
+        for line in std::io::BufReader::new(file).lines() {
+            let line = line?;
+            let line = line.trim();
+            let line_embeddings: Vec<f32> = line
+                .split_whitespace()
+                .map(|token| Ok::<_, anyhow::Error>(token.parse()?))
+                .collect::<Result<_>>()?;
+            embeddings.push(line_embeddings);
+        }
+        Ok(Self { embeddings })
+    }
+}
+
+fn cache<T: Cacheable, F: FnOnce() -> Result<T>>(path: &PathBuf, f: F) -> Result<T> {
+    if path.exists() {
+        T::load(path)
+    } else {
+        let value = f()?;
+        value.cache(path)?;
+        Ok(value)
+    }
+}
+
 fn main() -> Result<()> {
-    let CliArgs {
-        subcommand,
-    } = CliArgs::parse();
+    let CliArgs { subcommand } = CliArgs::parse();
 
     let progress_style = ProgressStyle::default_bar().template("{msg} {wide_bar} {pos}/{len}")?;
 
@@ -254,60 +346,80 @@ fn main() -> Result<()> {
         })
         .collect::<Result<Vec<_>, _>>()?;
 
+    let hash = blake3::hash(&file_lines.join("\n").as_bytes()).to_hex();
+
+    let tokens_cache_path = PathBuf::from(format!("{}.tokens", hash));
     let n_ctx = ctx.n_ctx() as usize;
 
-    let progress_bar = ProgressBar::new(file_lines.len() as u64).with_message("Tokenizing").with_style(progress_style.clone());
+    let tokens_lines_list = cache(&tokens_cache_path, || {
+        let progress_bar = ProgressBar::new(file_lines.len() as u64)
+            .with_message("Tokenizing")
+            .with_style(progress_style.clone());
+        // tokenize the prompt
+        let tokens_lines_list = file_lines
+            .par_iter()
+            .map(|line| {
+                let mut tok = model.str_to_token(&line, AddBos::Always)?;
+                if tok.len() > n_ctx {
+                    tok.truncate(n_ctx);
+                }
+                progress_bar.inc(1);
+                Ok::<_, StringToTokenError>(tok)
+            })
+            .collect::<Result<Vec<_>, _>>()
+            .with_context(|| format!("failed to tokenize {filename}"))?;
+        Ok(Tokens::new(tokens_lines_list))
+    })?
+    .tokens;
 
-    // tokenize the prompt
-    let tokens_lines_list = file_lines
-        .par_iter()
-        .map(|line| {
-            let mut tok = model.str_to_token(&line, AddBos::Always)?;
-            if tok.len() > n_ctx {
-                tok.truncate(n_ctx);
+    let embeddings_cache_path = PathBuf::from(format!("{}.embeddings", hash));
+
+    let embeddings = cache(&embeddings_cache_path, || {
+        // create a llama_batch with the size of the context
+        // we use this object to submit token data for decoding
+        let mut batch = LlamaBatch::new(n_ctx, 1);
+
+        let mut max_seq_id_batch = 0;
+        let mut output = Vec::with_capacity(tokens_lines_list.len());
+        let progress_bar = ProgressBar::new(tokens_lines_list.len() as u64)
+            .with_message("Embedding")
+            .with_style(progress_style);
+
+        for tokens in &tokens_lines_list {
+            // Flush the batch if the next prompt would exceed our batch size
+            if (batch.n_tokens() as usize + tokens.len()) > n_ctx {
+                batch_decode(
+                    &mut ctx,
+                    &mut batch,
+                    max_seq_id_batch,
+                    &mut output,
+                )?;
+                max_seq_id_batch = 0;
             }
+
+            batch.add_sequence(tokens, max_seq_id_batch, false)?;
+            max_seq_id_batch += 1;
             progress_bar.inc(1);
-            Ok::<_, StringToTokenError>(tok)
-        })
-        .collect::<Result<Vec<_>, _>>()
-        .with_context(|| format!("failed to tokenize {filename}"))?;
-
-    // create a llama_batch with the size of the context
-    // we use this object to submit token data for decoding
-    let mut batch = LlamaBatch::new(n_ctx, 1);
-
-    let mut max_seq_id_batch = 0;
-    let mut output = Vec::with_capacity(tokens_lines_list.len());
-    let progress_bar = ProgressBar::new(tokens_lines_list.len() as u64).with_message("Embedding").with_style(progress_style);
-
-    for tokens in &tokens_lines_list {
-        // Flush the batch if the next prompt would exceed our batch size
-        if (batch.n_tokens() as usize + tokens.len()) > n_ctx {
-            batch_decode(
-                &mut ctx,
-                &mut batch,
-                max_seq_id_batch,
-                &mut output,
-                *normalise,
-            )?;
-            max_seq_id_batch = 0;
         }
+        // Handle final batch
+        batch_decode(
+            &mut ctx,
+            &mut batch,
+            max_seq_id_batch,
+            &mut output,
+        )?;
+        progress_bar.finish();
+        Ok(Embeddings::new(output))
+    })?
+    .embeddings;
 
-        batch.add_sequence(tokens, max_seq_id_batch, false)?;
-        max_seq_id_batch += 1;
-        progress_bar.inc(1);
-    }
-    // Handle final batch
-    batch_decode(
-        &mut ctx,
-        &mut batch,
-        max_seq_id_batch,
-        &mut output,
-        *normalise,
-    )?;
-    progress_bar.finish();
+    let embeddings = if *normalise {
+        embeddings.into_iter().map(|e| normalize(&e)).collect()
+    } else {
+        embeddings
+    };
 
-    subcommand.run(output, file_lines)?;
+    subcommand.run(embeddings, file_lines)?;
 
     Ok(())
 }
@@ -317,7 +429,6 @@ fn batch_decode(
     batch: &mut LlamaBatch,
     s_batch: i32,
     output: &mut Vec<Vec<f32>>,
-    normalise: bool,
 ) -> Result<()> {
     ctx.clear_kv_cache();
     ctx.decode(batch).with_context(|| "llama_decode() failed")?;
@@ -326,13 +437,8 @@ fn batch_decode(
         let embedding = ctx
             .embeddings_seq_ith(i)
             .with_context(|| "Failed to get embeddings")?;
-        let output_embeddings = if normalise {
-            normalize(embedding)
-        } else {
-            embedding.to_vec()
-        };
 
-        output.push(output_embeddings);
+        output.push(embedding.to_vec());
     }
 
     batch.clear();
